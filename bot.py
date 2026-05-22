@@ -15,7 +15,7 @@ from openai import APIStatusError, RateLimitError, OpenAI
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TRACKER_API_KEY = os.getenv("TRACKER_API_KEY")
+HENRIK_API_KEY = os.getenv("HENRIK_API_KEY") or os.getenv("HDEV_API_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@ailatumbot").lower()
 DB_PATH = os.getenv("BOT_DB_PATH", "bot_memory.sqlite3")
 TRACKER_CACHE_MINUTES = int(os.getenv("TRACKER_CACHE_MINUTES", "30"))
@@ -51,7 +51,7 @@ SYSTEM_PROMPT = """
 - "Состав" - справочник по людям в чате, роли разных людей не смешивать;
 - "Недавний чат" - только контекст обсуждения, не подтвержденные факты;
 - запрещено выдумывать Tracker-цифры, матчи, winrate, K/D, ACS, ADR, HS%, KAST, агентов и карты;
-- если Tracker API/кэш не дал данные, честно скажи, что цифр нет;
+- если Henrik API/кэш не дал данные, честно скажи, что цифр нет;
 - в начале ответа добавляй источник: "По Tracker:", "По памяти:", "По описанию:" или "По чату:".
 
 Хороший ответ:
@@ -392,29 +392,126 @@ def set_cached_tracker(tracker_id: str, data: str):
         )
 
 
-def extract_tracker_stats(data: dict) -> str:
-    lines = []
-    profile = data.get("data", {})
-    platform_info = profile.get("platformInfo") or {}
-    user_info = profile.get("userInfo") or {}
-    if platform_info.get("platformUserHandle"):
-        lines.append(f"Профиль: {platform_info['platformUserHandle']}")
-    if user_info.get("countryCode"):
-        lines.append(f"Регион: {user_info['countryCode']}")
+def format_ratio(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}"
 
-    for segment in profile.get("segments", [])[:8]:
-        segment_name = segment.get("metadata", {}).get("name") or segment.get("type") or "segment"
-        stats = segment.get("stats") or {}
-        stat_lines = []
-        for key, value in stats.items():
-            display = value.get("displayName") or key
-            stat_value = value.get("displayValue")
-            if stat_value is not None:
-                stat_lines.append(f"{display}: {stat_value}")
-        if stat_lines:
-            lines.append(f"{segment_name}: " + "; ".join(stat_lines[:14]))
 
-    return "\n".join(lines[:30])
+def format_percent(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.0f}%"
+
+
+def find_match_player(match: dict, puuid: str | None, name: str, tag: str) -> dict | None:
+    players = ((match.get("players") or {}).get("all_players") or [])
+    for player in players:
+        if puuid and player.get("puuid") == puuid:
+            return player
+        if normalize(player.get("name", "")) == normalize(name) and normalize(player.get("tag", "")) == normalize(tag):
+            return player
+    return None
+
+
+def match_result(match: dict, player: dict) -> str:
+    teams = match.get("teams") or {}
+    team_name = normalize(player.get("team", ""))
+    team = teams.get(team_name) if isinstance(teams, dict) else None
+    if isinstance(team, dict) and "has_won" in team:
+        return "win" if team.get("has_won") else "loss"
+    if isinstance(team, dict) and "won" in team:
+        return "win" if team.get("won") else "loss"
+    return "n/a"
+
+
+def extract_valorant_stats(account: dict, mmr: dict | None, matches: dict | None, tracker_id: str) -> str:
+    name, tag = tracker_id.split("#", 1)
+    account_data = account.get("data") or {}
+    mmr_data = (mmr or {}).get("data") or {}
+    match_list = (matches or {}).get("data") or []
+    puuid = account_data.get("puuid")
+    region = account_data.get("region")
+
+    lines = [
+        f"Профиль: {account_data.get('name', name)}#{account_data.get('tag', tag)}",
+        f"Регион: {region or 'n/a'}",
+        f"Уровень аккаунта: {account_data.get('account_level', 'n/a')}",
+    ]
+
+    current = mmr_data.get("current") or {}
+    peak = mmr_data.get("peak") or {}
+    current_tier = (current.get("tier") or {}).get("name")
+    peak_tier = (peak.get("tier") or {}).get("name")
+    if current_tier:
+        lines.append(
+            "Текущий ранг: "
+            f"{current_tier}, RR {current.get('rr', 'n/a')}, last change {current.get('last_change', 'n/a')}"
+        )
+    if peak_tier:
+        season = (peak.get("season") or {}).get("short", "n/a")
+        lines.append(f"Пик ранга: {peak_tier}, сезон {season}")
+
+    recent_rows = []
+    total_kills = total_deaths = total_assists = total_damage = total_rounds = total_hs = total_shots = wins = games = 0
+    agents: dict[str, int] = {}
+    maps: dict[str, int] = {}
+
+    for match in match_list[:8]:
+        metadata = match.get("metadata") or {}
+        rounds = metadata.get("rounds_played") or 0
+        player = find_match_player(match, puuid, name, tag)
+        if not player:
+            continue
+
+        stats = player.get("stats") or {}
+        kills = int(stats.get("kills") or 0)
+        deaths = int(stats.get("deaths") or 0)
+        assists = int(stats.get("assists") or 0)
+        headshots = int(stats.get("headshots") or 0)
+        bodyshots = int(stats.get("bodyshots") or 0)
+        legshots = int(stats.get("legshots") or 0)
+        damage = int(player.get("damage_made") or 0)
+        result = match_result(match, player)
+        agent = player.get("character") or "n/a"
+        map_name = metadata.get("map") or "n/a"
+        kd = kills / deaths if deaths else None
+        adr = damage / rounds if rounds else None
+        hs_percent = headshots / (headshots + bodyshots + legshots) * 100 if headshots + bodyshots + legshots else None
+
+        games += 1
+        wins += 1 if result == "win" else 0
+        total_kills += kills
+        total_deaths += deaths
+        total_assists += assists
+        total_damage += damage
+        total_rounds += rounds
+        total_hs += headshots
+        total_shots += headshots + bodyshots + legshots
+        agents[agent] = agents.get(agent, 0) + 1
+        maps[map_name] = maps.get(map_name, 0) + 1
+
+        recent_rows.append(
+            f"{map_name}, {agent}, {result}, {kills}/{deaths}/{assists}, "
+            f"K/D {format_ratio(kd)}, ADR {format_ratio(adr)}, HS {format_percent(hs_percent)}"
+        )
+
+    if games:
+        lines.append(
+            "Последние матчи summary: "
+            f"{wins}/{games} wins, K/D {format_ratio(total_kills / total_deaths if total_deaths else None)}, "
+            f"ADR {format_ratio(total_damage / total_rounds if total_rounds else None)}, "
+            f"HS {format_percent(total_hs / total_shots * 100 if total_shots else None)}, "
+            f"K+A/D {format_ratio((total_kills + total_assists) / total_deaths if total_deaths else None)}"
+        )
+        lines.append("Агенты в последних матчах: " + ", ".join(f"{agent} x{count}" for agent, count in sorted(agents.items(), key=lambda item: -item[1])))
+        lines.append("Карты в последних матчах: " + ", ".join(f"{map_name} x{count}" for map_name, count in sorted(maps.items(), key=lambda item: -item[1])))
+        lines.append("Последние матчи:")
+        lines.extend(f"- {row}" for row in recent_rows)
+    else:
+        lines.append("Последние competitive матчи не найдены или профиль скрыт.")
+
+    return "\n".join(lines)
 
 
 async def fetch_tracker_profile(tracker_id: str, force_refresh: bool = False) -> tuple[str | None, str | None, bool]:
@@ -423,33 +520,42 @@ async def fetch_tracker_profile(tracker_id: str, force_refresh: bool = False) ->
         if cached:
             return cached, None, True
 
-    if not TRACKER_API_KEY:
-        return None, "TRACKER_API_KEY не задан в Render env.", False
+    if not HENRIK_API_KEY:
+        return None, "HENRIK_API_KEY или HDEV_API_KEY не задан в Render env.", False
 
-    encoded_id = quote(tracker_id, safe="")
-    urls = [
-        f"https://public-api.tracker.gg/api/v1/valorant/standard/profile/riot/{encoded_id}",
-        f"https://api.tracker.gg/api/v2/valorant/standard/profile/riot/{encoded_id}",
-    ]
-    headers = {"TRN-Api-Key": TRACKER_API_KEY}
+    name, tag = tracker_id.split("#", 1)
+    encoded_name = quote(name, safe="")
+    encoded_tag = quote(tag, safe="")
+    headers = {"Authorization": HENRIK_API_KEY}
 
     async with ClientSession(headers=headers) as session:
-        last_error = None
-        for url in urls:
-            try:
-                async with session.get(url, timeout=12) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        stats = extract_tracker_stats(data)
-                        if stats:
-                            set_cached_tracker(tracker_id, stats)
-                            return stats, None, False
-                        return None, "Tracker API ответил, но статистику не удалось разобрать.", False
+        try:
+            account_url = f"https://api.henrikdev.xyz/valorant/v2/account/{encoded_name}/{encoded_tag}"
+            async with session.get(account_url, timeout=12) as response:
+                if response.status != 200:
                     text = await response.text()
-                    last_error = f"Tracker API {response.status}: {text[:180]}"
-            except Exception as exc:
-                last_error = f"Tracker API error: {exc}"
-        return None, last_error, False
+                    return None, f"Henrik account API {response.status}: {text[:180]}", False
+                account = await response.json()
+
+            region = ((account.get("data") or {}).get("region") or "eu").lower()
+            mmr_url = f"https://api.henrikdev.xyz/valorant/v3/mmr/{region}/pc/{encoded_name}/{encoded_tag}"
+            matches_url = f"https://api.henrikdev.xyz/valorant/v3/matches/{region}/{encoded_name}/{encoded_tag}?mode=competitive&size=8"
+
+            mmr = None
+            async with session.get(mmr_url, timeout=12) as response:
+                if response.status == 200:
+                    mmr = await response.json()
+
+            matches = None
+            async with session.get(matches_url, timeout=18) as response:
+                if response.status == 200:
+                    matches = await response.json()
+
+            stats = extract_valorant_stats(account, mmr, matches, tracker_id)
+            set_cached_tracker(tracker_id, stats)
+            return stats, None, False
+        except Exception as exc:
+            return None, f"Henrik API error: {exc}", False
 
 
 def active_models() -> list[str]:
@@ -688,7 +794,7 @@ async def ru_help_reply(message: Message):
 async def photo_reply(message: Message):
     store_message(message)
     if is_addressed_to_bot(message.caption or ""):
-        await message.answer("По описанию: фото-анализ отключён, чтобы не сжигать vision-лимиты. Скинь цифры/ситуацию текстом.")
+        await message.answer("По описанию: фото сейчас не обрабатываю. Скинь цифры или ситуацию текстом, разберу нормально.")
 
 
 @dp.message(F.text)
