@@ -1,7 +1,7 @@
-aiogram==3.20.0.post0
-aiohttp==3.11.18
-openai==1.82.0
-opencv-python-headless==4.11.0.86
-pillow==11.2.1
-numpy==2.2.6
-pytesseract==0.3.13
+aiogram
+aiohttp
+openai
+opencv-python-headless
+pillow
+numpy
+pytesseract
