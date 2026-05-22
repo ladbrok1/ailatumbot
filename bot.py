@@ -1,723 +1,359 @@
-# ==============================
-# VALORANT AI TELEGRAM BOT
-# Production Core v2
-# ==============================
-# Stack:
-# - aiogram 3
-# - webhook mode
-# - Henrik API
-# - Groq API
-# - SQLite
-# - OCR screenshot analysis
-# - structured analytics engine
-# ==============================
-
 import asyncio
-import json
-import logging
 import os
 import re
 import sqlite3
-import statistics
-from collections import Counter
-from datetime import datetime, timedelta, timezone
-from io import BytesIO
-from typing import Any
+import json
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
-import aiohttp
-import cv2
-import numpy as np
-import pytesseract
-from PIL import Image
+from aiohttp import ClientSession
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message, Update
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
-from openai import OpenAI
+from aiogram.types import Message
+from openai import OpenAI, RateLimitError, APIStatusError
 
-# =========================================
+
+# =========================================================
 # ENV
-# =========================================
+# =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-HENRIK_API_KEY = os.getenv("HENRIK_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-PORT = int(os.getenv("PORT", "10000"))
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@ailatumbot").lower()
+HENRIK_API_KEY = os.getenv("HENRIK_API_KEY") or os.getenv("HDEV_API_KEY")
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN")
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "@latumbot").lower()
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY")
-
-if not HENRIK_API_KEY:
-    raise RuntimeError("Missing HENRIK_API_KEY")
-
-if not WEBHOOK_URL:
-    raise RuntimeError("Missing WEBHOOK_URL")
-
-# =========================================
-# LOGGING
-# =========================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-logger = logging.getLogger("valorant-bot")
-
-# =========================================
-# DATABASE
-# =========================================
-
-DB_PATH = "valorant_ai.sqlite3"
-
-
-def db_connect():
-    return sqlite3.connect(DB_PATH)
-
-
-def init_db():
-    with db_connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS players (
-                chat_id INTEGER,
-                user_id INTEGER,
-                name TEXT,
-                role TEXT,
-                rank TEXT,
-                main_agent TEXT,
-                tracker TEXT,
-                notes TEXT,
-                updated_at TEXT,
-                PRIMARY KEY(chat_id, user_id)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tracker_cache (
-                tracker TEXT PRIMARY KEY,
-                data TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS recent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                user_id INTEGER,
-                text TEXT,
-                created_at TEXT
-            )
-            """
-        )
-
-# =========================================
-# BOT
-# =========================================
-
-bot = Bot(
-    token=TELEGRAM_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-
-dp = Dispatcher()
-
-# =========================================
-# OPENAI/GROQ
-# =========================================
+TEXT_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GROQ_MODELS",
+        "llama-3.1-8b-instant,qwen/qwen3-32b,llama-3.3-70b-versatile"
+    ).split(",")
+    if m.strip()
+]
 
 client = OpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
 )
 
-TEXT_MODELS = [
-    "llama-3.1-8b-instant",
-    "qwen/qwen3-32b",
-    "meta-llama/llama-4-scout-17b-16e-instruct"
-]
+dp = Dispatcher()
 
-# =========================================
-# SYSTEM PROMPT
-# =========================================
 
-SYSTEM_PROMPT = """
-Ты профессиональный AI тренер по Valorant.
+# =========================================================
+# DB
+# =========================================================
 
-Правила:
-- не выдумывай статистику;
-- если данных нет — честно скажи;
-- отвечай кратко;
-- максимум 5 пунктов;
-- анализируй только реальные цифры;
-- не путай игроков;
-- пиши живым русским языком;
-- допускаются игровые термины;
-- не используй длинные вступления;
-- делай полезный анализ.
+def db():
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db():
+    with db() as c:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS players(
+            chat_id INTEGER,
+            user_id INTEGER,
+            name TEXT,
+            role TEXT,
+            agent TEXT,
+            rank TEXT,
+            tracker TEXT,
+            notes TEXT,
+            updated TEXT,
+            PRIMARY KEY(chat_id,user_id)
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS chat(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            user TEXT,
+            text TEXT,
+            ts TEXT
+        )
+        """)
+
+
+def now():
+    return datetime.utcnow().isoformat()
+
+
+# =========================================================
+# MEMORY
+# =========================================================
+
+def get_player(chat_id, user_id):
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        return c.execute(
+            "SELECT * FROM players WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id)
+        ).fetchone()
+
+
+def upsert_player(chat_id, user_id, name):
+    with db() as c:
+        c.execute("""
+        INSERT OR IGNORE INTO players(chat_id,user_id,name,updated)
+        VALUES(?,?,?,?)
+        """, (chat_id, user_id, name, now()))
+
+
+def set_field(chat_id, user_id, field, value):
+    if field not in {"role", "agent", "rank", "tracker", "notes"}:
+        return
+    with db() as c:
+        c.execute(f"""
+        UPDATE players SET {field}=?, updated=?
+        WHERE chat_id=? AND user_id=?
+        """, (value, now(), chat_id, user_id))
+
+
+def save_chat(chat_id, user, text):
+    with db() as c:
+        c.execute("""
+        INSERT INTO chat(chat_id,user,text,ts)
+        VALUES(?,?,?,?)
+        """, (chat_id, user, text[:800], now()))
+
+        c.execute("""
+        DELETE FROM chat WHERE id NOT IN (
+            SELECT id FROM chat ORDER BY id DESC LIMIT 60
+        )
+        """)
+
+
+def get_chat(chat_id):
+    with db() as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT user,text FROM chat WHERE chat_id=? ORDER BY id DESC LIMIT 10",
+            (chat_id,)
+        ).fetchall()
+
+    return "\n".join([f"{r['user']}: {r['text']}" for r in rows[::-1]])
+
+
+# =========================================================
+# UTILS FIXED
+# =========================================================
+
+def norm(t):
+    return (t or "").lower().replace("ё", "е").strip()
+
+
+def is_bot(text):
+    t = norm(text)
+    return BOT_USERNAME in t or t.startswith("бот ")
+
+
+def strip_bot(text):
+    return re.sub(re.escape(BOT_USERNAME), "", text, flags=re.I).strip()
+
+
+def user_name(msg):
+    if msg.from_user:
+        return msg.from_user.full_name
+    return "player"
+
+
+def extract_riot_id(text):
+    match = re.findall(r"([^\s#]+)#([^\s#]+)", text)
+    return match[0] if match else None
+
+
+# =========================================================
+# SYSTEM
+# =========================================================
+
+SYSTEM = """
+Ты Valorant AI тренер.
+
+ПРАВИЛА:
+- НИКОГДА не выдумывай
+- если данных нет → "нет данных"
+- анализ только по входным данным
+- кратко и структурно
 """
 
-# =========================================
-# HELPERS
-# =========================================
 
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-ROLE_ALIASES = {
-    "смокер": "controller",
-    "инициатор": "initiator",
-    "дуэлянт": "duelist",
-    "страж": "sentinel"
-}
-
-photo_waiting_users = {}
-
-# =========================================
-# TRACKER API
-# =========================================
-
-
-async def api_get(session, url):
-    headers = {
-        "Authorization": HENRIK_API_KEY
-    }
-
-    for attempt in range(3):
-        try:
-            async with session.get(url, headers=headers, timeout=20) as response:
-                if response.status == 200:
-                    return await response.json()
-
-                text = await response.text()
-
-                logger.warning(
-                    f"Henrik API {response.status}: {text[:200]}"
-                )
-
-                if response.status == 429:
-                    await asyncio.sleep(3)
-                    continue
-
-                return None
-
-        except Exception as exc:
-            logger.exception(exc)
-            await asyncio.sleep(2)
-
-    return None
-
-
-async def fetch_player_data(tracker: str):
-    if "#" not in tracker:
-        return None
-
-    name, tag = tracker.split("#", 1)
-
-    async with aiohttp.ClientSession() as session:
-
-        account_url = (
-            f"https://api.henrikdev.xyz/valorant/v2/account/{name}/{tag}"
-        )
-
-        account = await api_get(session, account_url)
-
-        if not account:
-            return None
-
-        region = (
-            account.get("data", {})
-            .get("region", "eu")
-        )
-
-        mmr_url = (
-            f"https://api.henrikdev.xyz/valorant/v3/mmr/{region}/pc/{name}/{tag}"
-        )
-
-        matches_url = (
-            f"https://api.henrikdev.xyz/valorant/v3/matches/{region}/{name}/{tag}?size=10"
-        )
-
-        mmr = await api_get(session, mmr_url)
-        matches = await api_get(session, matches_url)
-
-        return {
-            "account": account,
-            "mmr": mmr,
-            "matches": matches
-        }
-
-# =========================================
-# ANALYTICS ENGINE
-# =========================================
-
-
-def analyze_matches(data: dict):
-    matches = data.get("matches", {}).get("data", [])
-
-    if not matches:
-        return {
-            "summary": "Нет матчей",
-            "stats": {}
-        }
-
-    kills = []
-    deaths = []
-    assists = []
-    adr_values = []
-    hs_values = []
-    maps = []
-    agents = []
-    wins = 0
-
-    first_death_matches = 0
-
-    for match in matches:
-        metadata = match.get("metadata", {})
-        players = (
-            match.get("players", {})
-            .get("all_players", [])
-        )
-
-        if not players:
-            continue
-
-        player = players[0]
-
-        stats = player.get("stats", {})
-
-        k = stats.get("kills", 0)
-        d = stats.get("deaths", 1)
-        a = stats.get("assists", 0)
-
-        kills.append(k)
-        deaths.append(d)
-        assists.append(a)
-
-        damage = player.get("damage_made", 0)
-        rounds = metadata.get("rounds_played", 1)
-
-        adr = damage / max(rounds, 1)
-        adr_values.append(adr)
-
-        headshots = stats.get("headshots", 0)
-        bodyshots = stats.get("bodyshots", 0)
-        legshots = stats.get("legshots", 0)
-
-        total_shots = headshots + bodyshots + legshots
-
-        hs = 0
-
-        if total_shots > 0:
-            hs = (headshots / total_shots) * 100
-
-        hs_values.append(hs)
-
-        maps.append(metadata.get("map", "Unknown"))
-        agents.append(player.get("character", "Unknown"))
-
-        if player.get("team") == "Blue":
-            blue = match.get("teams", {}).get("blue", {})
-            if blue.get("has_won"):
-                wins += 1
-
-        if d >= 20:
-            first_death_matches += 1
-
-    avg_kd = sum(kills) / max(sum(deaths), 1)
-    avg_adr = statistics.mean(adr_values)
-    avg_hs = statistics.mean(hs_values)
-
-    best_agent = Counter(agents).most_common(1)[0][0]
-    best_map = Counter(maps).most_common(1)[0][0]
-
-    problems = []
-
-    if avg_hs < 18:
-        problems.append("низкий процент попаданий в голову")
-
-    if avg_adr < 120:
-        problems.append("низкий средний урон")
-
-    if avg_kd < 1:
-        problems.append("слишком много смертей")
-
-    if first_death_matches >= 4:
-        problems.append("часто погибаешь слишком рано")
-
-    return {
-        "stats": {
-            "kd": round(avg_kd, 2),
-            "adr": round(avg_adr, 1),
-            "hs": round(avg_hs, 1),
-            "winrate": round((wins / max(len(matches), 1)) * 100, 1),
-            "best_agent": best_agent,
-            "best_map": best_map,
-        },
-        "problems": problems,
-    }
-
-# =========================================
+# =========================================================
 # LLM
-# =========================================
+# =========================================================
 
+async def ask_llm(prompt, msg=None):
+    content = prompt
 
-async def ask_llm(prompt: str):
-    last_error = None
+    if msg:
+        content = get_chat(msg.chat.id) + "\n\n" + prompt
 
     for model in TEXT_MODELS:
         try:
-            response = client.chat.completions.create(
+            r = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": SYSTEM},
+                    {"role": "user", "content": content}
                 ],
-                temperature=0.3,
+                temperature=0.2,
                 max_completion_tokens=700
             )
+            return r.choices[0].message.content
 
-            return response.choices[0].message.content
+        except (RateLimitError, APIStatusError):
+            continue
 
-        except Exception as exc:
-            logger.exception(exc)
-            last_error = exc
-
-    return f"Ошибка модели: {last_error}"
-
-# =========================================
-# OCR
-# =========================================
+    return "Нет ответа"
 
 
-async def analyze_scoreboard_image(file_bytes: bytes):
-    image = Image.open(BytesIO(file_bytes))
+# =========================================================
+# SAFE HENRIK PARSER (FIXED)
+# =========================================================
 
-    image_np = np.array(image)
-
-    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
-
-    processed = cv2.threshold(
-        gray,
-        140,
-        255,
-        cv2.THRESH_BINARY
-    )[1]
-
-    text = pytesseract.image_to_string(
-        processed,
-        lang="eng"
-    )
-
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    players = []
-
-    for line in lines:
-        if re.search(r"\d+/\d+/\d+", line):
-            players.append(line)
-
-    return {
-        "raw": text[:4000],
-        "players": players[:10]
-    }
-
-# =========================================
-# COMMANDS
-# =========================================
+cache = {}
 
 
-@dp.message(Command("start"))
-async def start_cmd(message: Message):
-    await message.answer(
-        "AI тренер Valorant активен.\n\n"
-        "Команды:\n"
-        "/профиль\n"
-        "/разбор\n"
-        "/последняя\n"
-        "/фото\n"
-        "/состав\n"
-    )
-
-
-@dp.message(Command("фото"))
-async def photo_mode(message: Message):
-    photo_waiting_users[message.from_user.id] = True
-
-    await message.answer(
-        "Отправь скрин scoreboard или статистики."
-    )
-
-
-@dp.message(F.photo)
-async def photo_handler(message: Message):
-
-    waiting = photo_waiting_users.get(message.from_user.id)
-
-    if not waiting:
-        return
-
-    photo_waiting_users.pop(message.from_user.id, None)
-
-    await message.answer("Анализирую скрин...")
-
-    try:
-        photo = message.photo[-1]
-
-        file = await bot.get_file(photo.file_id)
-
-        downloaded = await bot.download_file(file.file_path)
-
-        file_bytes = downloaded.read()
-
-        result = await analyze_scoreboard_image(file_bytes)
-
-        prompt = f"""
-        Вот OCR со scoreboard Valorant.
-
-        Игроки:
-        {result['players']}
-
-        Сырой текст:
-        {result['raw']}
-
-        Сделай краткий анализ.
-        """
-
-        answer = await ask_llm(prompt)
-
-        await message.answer(answer)
-
-    except Exception as exc:
-        logger.exception(exc)
-        await message.answer(f"Ошибка анализа фото: {exc}")
-
-
-@dp.message(Command("разбор"))
-async def analysis_command(message: Message):
-
-    with db_connect() as conn:
-        row = conn.execute(
-            "SELECT tracker FROM players WHERE chat_id=? AND user_id=?",
-            (message.chat.id, message.from_user.id)
-        ).fetchone()
-
-    if not row:
-        await message.answer(
-            "Сначала укажи трекер: бот трекер Name#TAG"
-        )
-        return
-
-    tracker = row[0]
-
-    await message.answer("Получаю матчи...")
-
-    data = await fetch_player_data(tracker)
+def compact_tracker(data):
+    """УБИРАЕМ МУСОР JSON -> читаемый текст"""
 
     if not data:
-        await message.answer("Не удалось получить данные Henrik API")
-        return
+        return "нет данных"
 
-    analytics = analyze_matches(data)
+    profile = data.get("profile", {})
+    mmr = data.get("mmr", {})
+    matches = data.get("matches", {})
 
-    prompt = f"""
-    Статистика игрока:
+    text = []
+    text.append(f"PLAYER: {profile.get('name')}#{profile.get('tag')}")
+    text.append(f"REGION: {profile.get('region')}")
 
-    {json.dumps(analytics, ensure_ascii=False, indent=2)}
+    text.append("\nMMR:")
+    text.append(json.dumps(mmr, ensure_ascii=False)[:500])
 
-    Сделай профессиональный разбор.
-    """
+    text.append("\nMATCHES:")
+    text.append(json.dumps(matches, ensure_ascii=False)[:800])
 
-    answer = await ask_llm(prompt)
+    return "\n".join(text)
 
-    await message.answer(answer)
+
+async def fetch_tracker(rid):
+    if "#" not in rid:
+        return None
+
+    if rid in cache and cache[rid]["time"] > datetime.utcnow() - timedelta(minutes=20):
+        return cache[rid]["data"]
+
+    if not HENRIK_API_KEY:
+        return None
+
+    name, tag = rid.split("#")
+
+    headers = {"Authorization": HENRIK_API_KEY}
+
+    async with ClientSession(headers=headers) as s:
+        try:
+            acc_url = f"https://api.henrikdev.xyz/valorant/v2/account/{quote(name)}/{quote(tag)}"
+            async with s.get(acc_url) as r:
+                if r.status != 200:
+                    return None
+                acc = await r.json()
+
+            region = (acc.get("data") or {}).get("region", "eu")
+
+            mmr_url = f"https://api.henrikdev.xyz/valorant/v3/mmr/{region}/pc/{quote(name)}/{quote(tag)}"
+            match_url = f"https://api.henrikdev.xyz/valorant/v3/matches/{region}/{quote(name)}/{quote(tag)}?mode=competitive&size=5"
+
+            async with s.get(mmr_url) as r1:
+                mmr = await r1.json() if r1.status == 200 else {}
+
+            async with s.get(match_url) as r2:
+                matches = await r2.json() if r2.status == 200 else {}
+
+            parsed = {
+                "profile": {
+                    "name": name,
+                    "tag": tag,
+                    "region": region
+                },
+                "mmr": mmr,
+                "matches": matches
+            }
+
+            cache[rid] = {"data": parsed, "time": datetime.utcnow()}
+            return parsed
+
+        except Exception:
+            return None
+
+
+# =========================================================
+# HANDLER FIXED
+# =========================================================
+
+@dp.message(Command("start"))
+async def start(m: Message):
+    save_chat(m.chat.id, user_name(m), "/start")
+    await m.answer("Latumbot V5.1 активен")
 
 
 @dp.message(F.text)
-async def text_handler(message: Message):
+async def handler(m: Message):
+    text = m.text or ""
 
-    text = message.text.lower()
+    save_chat(m.chat.id, user_name(m), text)
 
-    if not (
-        BOT_USERNAME in text
-        or text.startswith("бот")
-        or text.startswith("вал")
-    ):
+    if not is_bot(text):
         return
 
-    cleaned = (
-        text
-        .replace(BOT_USERNAME, "")
-        .replace("бот", "")
-        .strip()
-    )
+    clean = strip_bot(text)
 
-    tracker_match = re.search(
-        r"([A-Za-z0-9_.-]{2,24}#[A-Za-z0-9]{2,8})",
-        cleaned
-    )
+    upsert_player(m.chat.id, m.from_user.id, user_name(m))
 
-    if tracker_match:
-        tracker = tracker_match.group(1)
+    # roles
+    if "смокер" in clean:
+        set_field(m.chat.id, m.from_user.id, "role", "controller")
+        return await m.answer("ок, смокер")
 
-        with db_connect() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO players (
-                    chat_id,
-                    user_id,
-                    name,
-                    tracker,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    message.chat.id,
-                    message.from_user.id,
-                    message.from_user.full_name,
-                    tracker,
-                    now_iso()
-                )
-            )
+    if "дуэлянт" in clean:
+        set_field(m.chat.id, m.from_user.id, "role", "duelist")
+        return await m.answer("ок, дуэлянт")
 
-        await message.answer(
-            f"Запомнил трекер: {tracker}"
-        )
+    # tracker FIXED
+    if "трекер" in clean:
+        rid = extract_riot_id(clean)
 
-        return
+        if rid:
+            data = await fetch_tracker(f"{rid[0]}#{rid[1]}")
+            if not data:
+                return await m.answer("нет данных")
 
-    if "последняя игра" in cleaned:
+            prompt = f"""
+АНАЛИЗ ИГРОКА:
+{compact_tracker(data)}
 
-        with db_connect() as conn:
-            row = conn.execute(
-                "SELECT tracker FROM players WHERE chat_id=? AND user_id=?",
-                (message.chat.id, message.from_user.id)
-            ).fetchone()
+1 вывод
+2 ошибки
+3 улучшения
+"""
 
-        if not row:
-            await message.answer("Сначала укажи трекер")
-            return
+            ans = await ask_llm(prompt, m)
+            return await m.answer(ans)
 
-        tracker = row[0]
-
-        data = await fetch_player_data(tracker)
-
-        if not data:
-            await message.answer("Henrik API не ответил")
-            return
-
-        matches = data.get("matches", {}).get("data", [])
-
-        if not matches:
-            await message.answer("Матчи не найдены")
-            return
-
-        last_match = matches[0]
-
-        prompt = f"""
-        Последний матч:
-
-        {json.dumps(last_match, ensure_ascii=False)[:6000]}
-
-        Сделай разбор.
-        """
-
-        answer = await ask_llm(prompt)
-
-        await message.answer(answer)
-
-        return
-
-    try:
-        answer = await ask_llm(cleaned)
-        await message.answer(answer)
-
-    except Exception as exc:
-        logger.exception(exc)
-        await message.answer(f"Ошибка: {exc}")
-
-# =========================================
-# ERROR MIDDLEWARE
-# =========================================
+    ans = await ask_llm(clean, m)
+    await m.answer(ans)
 
 
-@dp.errors()
-async def global_error_handler(event):
-    logger.exception(event.exception)
-    return True
-
-# =========================================
-# WEBHOOK
-# =========================================
-
-
-async def on_startup(bot: Bot):
-    await bot.set_webhook(WEBHOOK_URL)
-    logger.info("Webhook set")
-
-
-async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
-    logger.info("Webhook deleted")
-
-# =========================================
+# =========================================================
 # MAIN
-# =========================================
-
+# =========================================================
 
 async def main():
-
     init_db()
-
-    app = web.Application()
-
-    SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot
-    ).register(app, path="/")
-
-    setup_application(app, dp, bot=bot)
-
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    runner = web.AppRunner(app)
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        host="0.0.0.0",
-        port=PORT
-    )
-
-    logger.info(f"Starting webhook server on {PORT}")
-
-    await site.start()
-
-    while True:
-        await asyncio.sleep(3600)
+    bot = Bot(TELEGRAM_TOKEN)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
