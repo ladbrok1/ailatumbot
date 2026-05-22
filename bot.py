@@ -47,17 +47,20 @@ SYSTEM_PROMPT = """
 Правила:
 - отвечай конкретно, коротко и квалифицированно;
 - можно шутить и подкалывать, но без токсичности и личных оскорблений;
+- не пиши отдельные заголовки "Шутка:" или "Подкол:"; если подкалываешь, делай это естественно;
 - не путай игроков: профиль "Текущий автор" относится только к автору запроса;
 - "Состав" - справочник по людям в чате, роли разных людей не смешивать;
 - "Недавний чат" - только контекст обсуждения, не подтвержденные факты;
-- запрещено выдумывать Tracker-цифры, матчи, winrate, K/D, ACS, ADR, HS%, KAST, агентов и карты;
+- запрещено выдумывать Tracker-цифры, матчи, winrate, кд, ACS, ADR, HS%, KAST, агентов и карты;
 - если Henrik API/кэш не дал данные, честно скажи, что цифр нет;
+- пиши на живом русском: не "K/D ratio", а "кд"; не "ADR" без расшифровки, а "средний урон за раунд (ADR)";
+- советы привязывай к цифрам: карта, агент, кд, средний урон, HS%, результат матча;
 - в начале ответа добавляй источник: "По Tracker:", "По памяти:", "По описанию:" или "По чату:".
 
 Хороший ответ:
 1. короткий вывод;
 2. 2-4 конкретных действия;
-3. лёгкий дружеский подкол, если уместно.
+3. короткий естественный подкол, если уместно.
 """
 
 ROLE_ALIASES = {
@@ -211,13 +214,7 @@ def upsert_player(message: Message):
                 username = excluded.username,
                 updated_at = excluded.updated_at
             """,
-            (
-                message.chat.id,
-                message.from_user.id,
-                display_name(message),
-                message.from_user.username,
-                now_iso(),
-            ),
+            (message.chat.id, message.from_user.id, display_name(message), message.from_user.username, now_iso()),
         )
 
 
@@ -260,14 +257,7 @@ def store_message(message: Message):
             INSERT INTO chat_messages (chat_id, user_id, display_name, text, addressed, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                message.chat.id,
-                message.from_user.id,
-                display_name(message),
-                text[:1000],
-                1 if is_addressed_to_bot(text) else 0,
-                now_iso(),
-            ),
+            (message.chat.id, message.from_user.id, display_name(message), text[:1000], 1 if is_addressed_to_bot(text) else 0, now_iso()),
         )
         conn.execute(
             """
@@ -292,10 +282,7 @@ def get_player(chat_id: int, user_id: int):
 def get_players(chat_id: int):
     with db_connect() as conn:
         conn.row_factory = sqlite3.Row
-        return conn.execute(
-            "SELECT * FROM players WHERE chat_id = ? ORDER BY display_name",
-            (chat_id,),
-        ).fetchall()
+        return conn.execute("SELECT * FROM players WHERE chat_id = ? ORDER BY display_name", (chat_id,)).fetchall()
 
 
 def get_recent_messages(chat_id: int, limit: int = 12):
@@ -341,7 +328,6 @@ def memory_context(message: Message) -> str:
     current = get_player(message.chat.id, message.from_user.id) if message.from_user else None
     players = get_players(message.chat.id)
     recent = get_recent_messages(message.chat.id)
-
     lines = [
         "ПАМЯТЬ. Используй как справочник, не смешивай игроков.",
         f"Текущий автор запроса: {player_line(current) if current else display_name(message)}",
@@ -360,7 +346,7 @@ def memory_context(message: Message) -> str:
 def tracker_id_from_text(text: str) -> str | None:
     match = re.search(r"([A-Za-z0-9А-Яа-я_. -]{2,32}#[A-Za-z0-9А-Яа-я]{2,8})", text)
     if match:
-        return match.group(1).strip()
+        return re.sub(r"\s+", "", match.group(1).strip())
     return None
 
 
@@ -378,6 +364,15 @@ def get_cached_tracker(tracker_id: str) -> str | None:
     return row[0]
 
 
+def any_cached_tracker_for_name(name: str) -> tuple[str, str] | None:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT tracker_id, data FROM tracker_cache").fetchall()
+    for tracker_id, data in rows:
+        if normalize(tracker_id.split("#", 1)[0]) == normalize(name):
+            return tracker_id, data
+    return None
+
+
 def set_cached_tracker(tracker_id: str, data: str):
     with db_connect() as conn:
         conn.execute(
@@ -393,15 +388,11 @@ def set_cached_tracker(tracker_id: str, data: str):
 
 
 def format_ratio(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.2f}"
+    return "n/a" if value is None else f"{value:.2f}"
 
 
 def format_percent(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.0f}%"
+    return "n/a" if value is None else f"{value:.0f}%"
 
 
 def find_match_player(match: dict, puuid: str | None, name: str, tag: str) -> dict | None:
@@ -444,10 +435,7 @@ def extract_valorant_stats(account: dict, mmr: dict | None, matches: dict | None
     current_tier = (current.get("tier") or {}).get("name")
     peak_tier = (peak.get("tier") or {}).get("name")
     if current_tier:
-        lines.append(
-            "Текущий ранг: "
-            f"{current_tier}, RR {current.get('rr', 'n/a')}, last change {current.get('last_change', 'n/a')}"
-        )
+        lines.append(f"Текущий ранг: {current_tier}, RR {current.get('rr', 'n/a')}, изменение за матч {current.get('last_change', 'n/a')}")
     if peak_tier:
         season = (peak.get("season") or {}).get("short", "n/a")
         lines.append(f"Пик ранга: {peak_tier}, сезон {season}")
@@ -457,7 +445,7 @@ def extract_valorant_stats(account: dict, mmr: dict | None, matches: dict | None
     agents: dict[str, int] = {}
     maps: dict[str, int] = {}
 
-    for match in match_list[:8]:
+    for index, match in enumerate(match_list[:8], start=1):
         metadata = match.get("metadata") or {}
         rounds = metadata.get("rounds_played") or 0
         player = find_match_player(match, puuid, name, tag)
@@ -492,17 +480,17 @@ def extract_valorant_stats(account: dict, mmr: dict | None, matches: dict | None
         maps[map_name] = maps.get(map_name, 0) + 1
 
         recent_rows.append(
-            f"{map_name}, {agent}, {result}, {kills}/{deaths}/{assists}, "
-            f"K/D {format_ratio(kd)}, ADR {format_ratio(adr)}, HS {format_percent(hs_percent)}"
+            f"#{index}: {map_name}, {agent}, {result}, {kills}/{deaths}/{assists}, "
+            f"кд {format_ratio(kd)}, средний урон за раунд {format_ratio(adr)}, HS {format_percent(hs_percent)}"
         )
 
     if games:
         lines.append(
             "Последние матчи summary: "
-            f"{wins}/{games} wins, K/D {format_ratio(total_kills / total_deaths if total_deaths else None)}, "
-            f"ADR {format_ratio(total_damage / total_rounds if total_rounds else None)}, "
+            f"{wins}/{games} wins, кд {format_ratio(total_kills / total_deaths if total_deaths else None)}, "
+            f"средний урон за раунд {format_ratio(total_damage / total_rounds if total_rounds else None)}, "
             f"HS {format_percent(total_hs / total_shots * 100 if total_shots else None)}, "
-            f"K+A/D {format_ratio((total_kills + total_assists) / total_deaths if total_deaths else None)}"
+            f"(kills+assists)/deaths {format_ratio((total_kills + total_assists) / total_deaths if total_deaths else None)}"
         )
         lines.append("Агенты в последних матчах: " + ", ".join(f"{agent} x{count}" for agent, count in sorted(agents.items(), key=lambda item: -item[1])))
         lines.append("Карты в последних матчах: " + ", ".join(f"{map_name} x{count}" for map_name, count in sorted(maps.items(), key=lambda item: -item[1])))
@@ -514,7 +502,26 @@ def extract_valorant_stats(account: dict, mmr: dict | None, matches: dict | None
     return "\n".join(lines)
 
 
+def last_match_block(tracker_data: str) -> str:
+    lines = tracker_data.splitlines()
+    header = []
+    last = None
+    for line in lines:
+        if line.startswith(("Профиль:", "Текущий ранг:", "Пик ранга:")):
+            header.append(line)
+        if line.startswith("- #1:"):
+            last = line[2:]
+            break
+    if not last:
+        return tracker_data
+    return "\n".join(header + ["Последний competitive матч:", last])
+
+
 async def fetch_tracker_profile(tracker_id: str, force_refresh: bool = False) -> tuple[str | None, str | None, bool]:
+    tracker_id = re.sub(r"\s+", "", tracker_id.strip())
+    if "#" not in tracker_id:
+        return None, "Riot ID должен быть в формате Name#TAG.", False
+
     if not force_refresh:
         cached = get_cached_tracker(tracker_id)
         if cached:
@@ -534,6 +541,10 @@ async def fetch_tracker_profile(tracker_id: str, force_refresh: bool = False) ->
             async with session.get(account_url, timeout=12) as response:
                 if response.status != 200:
                     text = await response.text()
+                    fallback = any_cached_tracker_for_name(name)
+                    if fallback:
+                        cached_id, cached_data = fallback
+                        return cached_data, f"Henrik account API {response.status}, использую кэш похожего профиля {cached_id}.", True
                     return None, f"Henrik account API {response.status}: {text[:180]}", False
                 account = await response.json()
 
@@ -583,7 +594,11 @@ async def ask_groq(text: str, message: Message | None = None, tracker_data: str 
     if tracker_data:
         user_content += f"\n\nTRACKER_DATA. Только эти цифры можно считать реальными:\n{tracker_data}"
         source_hint = "По Tracker"
-    user_content += f"\n\nОбязательная маркировка источника ответа: начни ответ с '{source_hint}:'."
+    user_content += (
+        f"\n\nНачни ответ с '{source_hint}:'. "
+        "Не используй заголовки 'Шутка'/'Подкол'. Не пиши 'K/D ratio', пиши 'кд'. "
+        "Если есть TRACKER_DATA, дай разбор строго по цифрам, без общих советов."
+    )
 
     tried_models = []
     last_error = None
@@ -597,7 +612,7 @@ async def ask_groq(text: str, message: Message | None = None, tracker_data: str 
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.25,
+                temperature=0.2,
                 max_completion_tokens=650,
             )
             return response.choices[0].message.content
@@ -667,11 +682,11 @@ async def send_help(message: Message):
         f"{BOT_USERNAME} трекер Name#TAG\n"
         f"{BOT_USERNAME} профиль\n"
         f"{BOT_USERNAME} состав\n"
-        f"{BOT_USERNAME} обнови трекер\n"
+        f"{BOT_USERNAME} обнови трекер Name#TAG\n"
+        f"{BOT_USERNAME} по последней моей игре в ранкед что скажешь\n"
         f"{BOT_USERNAME} план на Ascent за атаку нашим составом\n"
-        f"{BOT_USERNAME} как мне улучшить игру\n"
-        f"{BOT_USERNAME} разберите наш прошлый раунд\n\n"
-        "Самое полезное: профиль, состав, Tracker/Riot ID, разбор ошибок, план раунда, советы по роли."
+        f"{BOT_USERNAME} как мне улучшить игру\n\n"
+        "Самое полезное: профиль, состав, Tracker/Riot ID, последняя игра, разбор ошибок, план раунда."
     )
 
 
@@ -691,12 +706,19 @@ async def send_roster(message: Message):
     await message.answer("По памяти: состав\n" + "\n".join(f"- {player_line(player)}" for player in players))
 
 
-async def handle_tracker(message: Message, query: str, force_refresh: bool = False):
+async def tracker_id_for_message(message: Message, query: str) -> str | None:
     tracker_id = tracker_id_from_text(query)
-    if not tracker_id and message.from_user:
+    if tracker_id:
+        return tracker_id
+    if message.from_user:
         player = get_player(message.chat.id, message.from_user.id)
-        tracker_id = player["tracker"] if player and player["tracker"] else None
+        if player and player["tracker"]:
+            return player["tracker"]
+    return None
 
+
+async def handle_tracker(message: Message, query: str, force_refresh: bool = False, last_match_only: bool = False):
+    tracker_id = await tracker_id_for_message(message, query)
     if not tracker_id:
         await message.answer(f"По Tracker: дай Riot ID: {BOT_USERNAME} трекер Name#TAG")
         return
@@ -705,20 +727,23 @@ async def handle_tracker(message: Message, query: str, force_refresh: bool = Fal
     tracker_data, tracker_error, from_cache = await fetch_tracker_profile(tracker_id, force_refresh=force_refresh)
     if not tracker_data:
         await message.answer(
-            "По Tracker: API не дал статистику. "
-            f"Причина: {tracker_error or 'нет данных'}. "
-            "Скинь цифры текстом: winrate, K/D, ADR, ACS, HS%, KAST, топ-агенты, карты."
+            "По Tracker: не смог получить статистику. "
+            f"Причина: {tracker_error or 'нет данных'}. Проверь формат Riot ID: Name#TAG."
         )
         return
 
+    data_for_model = last_match_block(tracker_data) if last_match_only else tracker_data
     try:
         cache_note = "Данные из кэша." if from_cache else "Данные свежие из API."
-        answer = await ask_groq(
-            f"{cache_note} Проанализируй Tracker профиль {tracker_id}. Дай выводы по игре и 3 приоритета для улучшения.",
-            message,
-            tracker_data=tracker_data,
-            source_hint="По Tracker",
+        if tracker_error:
+            cache_note += f" Примечание: {tracker_error}"
+        task = (
+            f"{cache_note} Разбери последний competitive матч профиля {tracker_id}. "
+            "Дай вывод по карте/агенту/счёту KDA/кд/среднему урону/HS и 3 конкретных действия."
+            if last_match_only
+            else f"{cache_note} Проанализируй профиль {tracker_id}. Дай форму, главный паттерн и 3 конкретных приоритета. Не советуй менять агента без основания из данных."
         )
+        answer = await ask_groq(task, message, tracker_data=data_for_model, source_hint="По Tracker")
     except RuntimeError as exc:
         answer = str(exc)
     await message.answer(answer)
@@ -748,10 +773,16 @@ async def handle_utility(message: Message, text: str) -> bool:
     if lowered in {"состав", "ростер", "кто на чем играет", "кто на чём играет"}:
         await send_roster(message)
         return True
+    if any(phrase in lowered for phrase in ("последняя игра", "последней игре", "последний ранкед", "последней ранкед")):
+        await handle_tracker(message, text, last_match_only=True)
+        return True
     if lowered.startswith(("обнови трекер", "обновить трекер", "refresh tracker")):
         await handle_tracker(message, text, force_refresh=True)
         return True
-    if lowered.startswith(("трекер", "tracker")) or tracker_id_from_text(text):
+    if lowered.startswith(("трекер", "tracker")) or (
+        tracker_id_from_text(text)
+        and any(word in lowered for word in ("профиль", "стат", "трекер", "tracker", "глянь", "посмотри", "анализ"))
+    ):
         await handle_tracker(message, text)
         return True
     if lowered.startswith(("план", "страта", "стратегия", "разберите", "разбор команды")):
@@ -834,7 +865,6 @@ async def start_health_server():
     port = os.getenv("PORT")
     if not port:
         return None
-
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
