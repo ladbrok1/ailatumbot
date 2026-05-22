@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 token.txt
+*.sqlite3
+*.db
