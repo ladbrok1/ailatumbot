@@ -411,7 +411,11 @@ async def handler(m: Message):
     # non-blocking DB writes
     await save_chat(m.chat.id, user_name(m), text)
 
-    if not is_bot(text):
+    # Log incoming message briefly for debugging
+    log.info("Handling message from %s (%s) in chat %s: %s", user_name(m), getattr(m.from_user, 'id', None), m.chat.id, (text or '')[:120])
+
+    # Respond when: bot is mentioned, message is a command, or in private chat
+    if not is_bot(text) and getattr(m.chat, 'type', None) != 'private' and not (text or '').strip().startswith("/"):
         return
 
     clean = strip_bot(text)
@@ -451,7 +455,9 @@ async def handler(m: Message):
             except Exception as exc:
                 log.exception("LLM failed: %s", exc)
                 ans = "Ошибка LLM. Попробуйте позже."
-            return await m.answer(ans)
+            sent = await m.answer(ans)
+            log.info("Sent tracker reply to chat %s", m.chat.id)
+            return sent
 
     try:
         ans = await ask_llm(clean, m)
@@ -461,7 +467,8 @@ async def handler(m: Message):
         log.exception("LLM failed: %s", exc)
         ans = "Ошибка LLM. Попробуйте позже."
 
-    await m.answer(ans)
+    sent = await m.answer(ans)
+    log.info("Sent reply to chat %s", m.chat.id)
 
 
 # =========================================================
