@@ -473,7 +473,7 @@ def compute_analytics(riot_id, parsed_matches):
     }
 
 
-def save_parsed_data(riot_id, profile, analytics, parsed_matches):
+async def save_parsed_data(riot_id, profile, analytics, parsed_matches):
     """Сохраняем распарсенные данные в БД"""
     def _save(riot_id, profile, analytics, parsed_matches):
         with db() as c:
