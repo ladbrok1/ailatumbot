@@ -398,6 +398,120 @@ async def fetch_tracker(rid, retries: int = 2, timeout_seconds: int = 10):
 # HANDLERS
 # =========================================================
 
+
+# Helper to find last Riot ID mentioned in recent chat history
+async def find_last_rid(chat_id: int):
+    def _find(chat_id):
+        with db() as c:
+            c.row_factory = sqlite3.Row
+            rows = c.execute(
+                "SELECT text FROM chat WHERE chat_id=? ORDER BY id DESC LIMIT 60",
+                (chat_id,)
+            ).fetchall()
+            for r in rows:
+                txt = r["text"] or ""
+                match = re.findall(r"([^\s#]+)#([^\s#]+)", txt)
+                if match:
+                    return f"{match[0][0]}#{match[0][1]}"
+            return None
+    return await asyncio.to_thread(_find, chat_id)
+
+
+# Try to summarize basic metrics from Henrik matches payload defensively
+def summarize_matches(matches):
+    # matches may be a dict or list; try common keys
+    lst = None
+    if not matches:
+        return None
+    if isinstance(matches, list):
+        lst = matches
+    elif isinstance(matches, dict):
+        lst = matches.get("data") or matches.get("matches") or matches.get("results")
+    if not lst or not isinstance(lst, list):
+        return None
+
+    total = len(lst)
+    wins = 0
+    losses = 0
+    kills = 0
+    deaths = 0
+    scores = 0
+
+    for m in lst:
+        # try several possible shapes
+        stats = m.get("stats") or m.get("player_stats") or m
+        k = stats.get("kills") if isinstance(stats, dict) else None
+        d = stats.get("deaths") if isinstance(stats, dict) else None
+        s = stats.get("score") if isinstance(stats, dict) else None
+        # fallback top-level
+        k = k or m.get("kills") or m.get("kills_total")
+        d = d or m.get("deaths") or m.get("deaths_total")
+        s = s or m.get("score") or m.get("points")
+
+        try:
+            kills += int(k or 0)
+        except Exception:
+            pass
+        try:
+            deaths += int(d or 0)
+        except Exception:
+            pass
+        try:
+            scores += int(s or 0)
+        except Exception:
+            pass
+
+        # win detection
+        result = (m.get("team" ) or {}).get("result") if isinstance(m.get("team"), dict) else m.get("result")
+        if isinstance(result, str) and result.lower() in {"win", "w", "victory"}:
+            wins += 1
+        elif isinstance(result, str) and result.lower() in {"loss", "l", "defeat"}:
+            losses += 1
+        else:
+            # try booleans
+            if m.get("won") is True or m.get("is_win") is True:
+                wins += 1
+            elif m.get("won") is False or m.get("is_win") is False:
+                losses += 1
+
+    avg_k = kills / total if total else 0
+    avg_d = deaths / total if total else 0
+    avg_s = scores / total if total else 0
+
+    return {
+        "matches": total,
+        "wins": wins,
+        "losses": losses,
+        "kills": kills,
+        "deaths": deaths,
+        "avg_kills": round(avg_k, 2),
+        "avg_deaths": round(avg_d, 2),
+        "avg_score": round(avg_s, 2),
+    }
+
+
+def format_metrics(profile, mmr, matches):
+    parts = []
+    parts.append(f"PLAYER: {profile.get('name')}#{profile.get('tag')}")
+    parts.append(f"REGION: {profile.get('region')}")
+    if isinstance(mmr, dict):
+        mmr_val = mmr.get('mmr') or mmr.get('rating') or mmr.get('current') or str(mmr)
+        parts.append(f"MMR summary: {mmr_val}")
+    else:
+        parts.append(f"MMR: {mmr}")
+
+    s = summarize_matches(matches)
+    if s:
+        parts.append("\nMATCHES SUMMARY:")
+        parts.append(f"Total matches: {s['matches']}")
+        parts.append(f"Wins: {s['wins']}, Losses: {s['losses']}")
+        parts.append(f"Kills/Deaths: {s['kills']}/{s['deaths']}")
+        parts.append(f"Avg Kills: {s['avg_kills']}, Avg Deaths: {s['avg_deaths']}, Avg Score: {s['avg_score']}")
+    else:
+        parts.append("Matches: нет подробных данных")
+
+    return "\n".join(parts)
+
 @dp.message(Command("start"))
 async def start(m: Message):
     await save_chat(m.chat.id, user_name(m), "/start")
@@ -434,30 +548,56 @@ async def handler(m: Message):
     # tracker
     if "трекер" in clean:
         rid = extract_riot_id(clean)
+        lower = (clean or "").lower()
 
-        if rid:
+        # If Riot ID provided inline, use it. Otherwise try to resolve from recent chat history when user asks "скинь все" or similar follow-up
+        if not rid:
+            # follow-up requests like "по трекеру скажи какие показатели" or "скинь все"
+            if any(k in lower for k in ("скинь", "все", "показатель", "какие показатели", "дай все")):
+                rid_str = await find_last_rid(m.chat.id)
+                if not rid_str:
+                    return await m.answer("Не нашёл последнего упоминания RiotID в чате. Пожалуйста, укажи RiotID в формате name#tag.")
+            else:
+                return await m.answer("Пожалуйста, укажи RiotID в формате name#tag, например: aisokuro#ako")
+        else:
             rid_str = f"{rid[0]}#{rid[1]}"
-            data = await fetch_tracker(rid_str)
-            if not data:
-                return await m.answer("По Tracker: нет данных или Henrik API не доступен.")
 
-            prompt = f"""
+        data = await fetch_tracker(rid_str)
+        if not data:
+            return await m.answer("По Tracker: нет данных или Henrik API не доступен.")
+
+        # If user explicitly asked to "скинь все" or "все показатели", provide a full metrics dump
+        if any(k in lower for k in ("скинь", "все", "всё", "показатель", "все показатели")):
+            try:
+                profile = data.get("profile", {})
+                mmr = data.get("mmr", {})
+                matches = data.get("matches", {})
+                text = format_metrics(profile, mmr, matches)
+                sent = await m.answer(text)
+                log.info("Sent full tracker metrics to chat %s for %s", m.chat.id, rid_str)
+                return sent
+            except Exception as exc:
+                log.exception("Failed to format full metrics: %s", exc)
+                return await m.answer("Не удалось собрать полные показатели. Попробуйте позже.")
+
+        # Default behavior: short compact analysis via LLM
+        prompt = f"""
 АНАЛИЗ ИГРОКА:
 {compact_tracker(data)}
 
 Дай короткий вывод и 3 конкретных действия. Без выдумок.
 """
 
-            try:
-                ans = await ask_llm(prompt, m)
-            except RuntimeError as exc:
-                ans = str(exc)
-            except Exception as exc:
-                log.exception("LLM failed: %s", exc)
-                ans = "Ошибка LLM. Попробуйте позже."
-            sent = await m.answer(ans)
-            log.info("Sent tracker reply to chat %s", m.chat.id)
-            return sent
+        try:
+            ans = await ask_llm(prompt, m)
+        except RuntimeError as exc:
+            ans = str(exc)
+        except Exception as exc:
+            log.exception("LLM failed: %s", exc)
+            ans = "Ошибка LLM. Попробуйте позже."
+        sent = await m.answer(ans)
+        log.info("Sent tracker reply to chat %s", m.chat.id)
+        return sent
 
     try:
         ans = await ask_llm(clean, m)
