@@ -3,14 +3,20 @@ import os
 import re
 import sqlite3
 import json
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout, web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.exceptions import TelegramConflictError
 from openai import OpenAI, RateLimitError, APIStatusError
+
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
 # =========================================================
@@ -22,8 +28,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HENRIK_API_KEY = os.getenv("HENRIK_API_KEY") or os.getenv("HDEV_API_KEY")
 
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "@latumbot").lower()
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+if not BOT_USERNAME.startswith("@"):
+    BOT_USERNAME = "@" + BOT_USERNAME
 
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+PORT = os.getenv("PORT")
+
+# Models and cooldowns
 TEXT_MODELS = [
     m.strip()
     for m in os.getenv(
@@ -32,6 +43,17 @@ TEXT_MODELS = [
     ).split(",")
     if m.strip()
 ]
+MODEL_COOLDOWN_SECONDS = int(os.getenv("MODEL_COOLDOWN_SECONDS", "90"))
+MODEL_COOLDOWNS: dict[str, datetime] = {}
+
+# Require critical envs early
+if not TELEGRAM_TOKEN:
+    log.error("TELEGRAM_TOKEN is not set")
+    raise RuntimeError("Set TELEGRAM_TOKEN environment variable")
+
+if not GROQ_API_KEY:
+    log.error("GROQ_API_KEY is not set")
+    raise RuntimeError("Set GROQ_API_KEY environment variable")
 
 client = OpenAI(
     api_key=GROQ_API_KEY,
@@ -42,11 +64,30 @@ dp = Dispatcher()
 
 
 # =========================================================
-# DB
+# Small helpers
+# =========================================================
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_iso() -> str:
+    return now_utc().isoformat()
+
+
+# =========================================================
+# DB helpers (sync) and async wrappers
 # =========================================================
 
 def db():
-    return sqlite3.connect(DB_PATH)
+    # per-operation connection with pragmas to reduce locking
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    return conn
 
 
 def init_db():
@@ -77,15 +118,8 @@ def init_db():
         """)
 
 
-def now():
-    return datetime.utcnow().isoformat()
-
-
-# =========================================================
-# MEMORY
-# =========================================================
-
-def get_player(chat_id, user_id):
+# synchronous DB operations
+def _get_player(chat_id, user_id):
     with db() as c:
         c.row_factory = sqlite3.Row
         return c.execute(
@@ -94,30 +128,30 @@ def get_player(chat_id, user_id):
         ).fetchone()
 
 
-def upsert_player(chat_id, user_id, name):
+def _upsert_player(chat_id, user_id, name):
     with db() as c:
         c.execute("""
         INSERT OR IGNORE INTO players(chat_id,user_id,name,updated)
         VALUES(?,?,?,?)
-        """, (chat_id, user_id, name, now()))
+        """, (chat_id, user_id, name, now_iso()))
 
 
-def set_field(chat_id, user_id, field, value):
+def _set_field(chat_id, user_id, field, value):
     if field not in {"role", "agent", "rank", "tracker", "notes"}:
         return
     with db() as c:
         c.execute(f"""
         UPDATE players SET {field}=?, updated=?
         WHERE chat_id=? AND user_id=?
-        """, (value, now(), chat_id, user_id))
+        """, (value, now_iso(), chat_id, user_id))
 
 
-def save_chat(chat_id, user, text):
+def _save_chat(chat_id, user, text):
     with db() as c:
         c.execute("""
         INSERT INTO chat(chat_id,user,text,ts)
         VALUES(?,?,?,?)
-        """, (chat_id, user, text[:800], now()))
+        """, (chat_id, user, text[:800], now_iso()))
 
         c.execute("""
         DELETE FROM chat WHERE id NOT IN (
@@ -126,7 +160,7 @@ def save_chat(chat_id, user, text):
         """)
 
 
-def get_chat(chat_id):
+def _get_chat(chat_id):
     with db() as c:
         c.row_factory = sqlite3.Row
         rows = c.execute(
@@ -137,8 +171,29 @@ def get_chat(chat_id):
     return "\n".join([f"{r['user']}: {r['text']}" for r in rows[::-1]])
 
 
+# async wrappers to avoid blocking the event loop
+async def get_player(chat_id, user_id):
+    return await asyncio.to_thread(_get_player, chat_id, user_id)
+
+
+async def upsert_player(chat_id, user_id, name):
+    return await asyncio.to_thread(_upsert_player, chat_id, user_id, name)
+
+
+async def set_field(chat_id, user_id, field, value):
+    return await asyncio.to_thread(_set_field, chat_id, user_id, field, value)
+
+
+async def save_chat(chat_id, user, text):
+    return await asyncio.to_thread(_save_chat, chat_id, user, text)
+
+
+async def get_chat(chat_id):
+    return await asyncio.to_thread(_get_chat, chat_id)
+
+
 # =========================================================
-# UTILS FIXED
+# UTILS
 # =========================================================
 
 def norm(t):
@@ -156,7 +211,7 @@ def strip_bot(text):
 
 def user_name(msg):
     if msg.from_user:
-        return msg.from_user.full_name
+        return msg.from_user.full_name or msg.from_user.username or str(msg.from_user.id)
     return "player"
 
 
@@ -181,16 +236,41 @@ SYSTEM = """
 
 
 # =========================================================
+# Model helpers
+# =========================================================
+
+def active_models() -> list[str]:
+    now = now_utc()
+    return [m for m in TEXT_MODELS if MODEL_COOLDOWNS.get(m, now - timedelta(seconds=1)) <= now]
+
+
+def groq_limit_message(error: Exception, tried_models: list[str]) -> str:
+    models = ", ".join(tried_models) or "нет доступных моделей"
+    if isinstance(error, RateLimitError) or getattr(error, "status_code", None) == 429:
+        return (
+            f"Groq лимит. Пробовал: {models}. Подожди {MODEL_COOLDOWN_SECONDS} секунд или снизь частоту запросов."
+        )
+    if isinstance(error, APIStatusError):
+        return f"Groq вернул ошибку {error.status_code}. Модели: {models}."
+    return "Groq не ответил. Попробуй ещё раз позже."
+
+
+# =========================================================
 # LLM
 # =========================================================
 
-async def ask_llm(prompt, msg=None):
+async def ask_llm(prompt, msg=None, max_tokens: int = 700):
     content = prompt
 
     if msg:
-        content = get_chat(msg.chat.id) + "\n\n" + prompt
+        hist = await get_chat(msg.chat.id)
+        content = hist + "\n\n" + prompt
 
-    for model in TEXT_MODELS:
+    tried = []
+    last_exc = None
+    models = active_models() or TEXT_MODELS
+    for model in models:
+        tried.append(model)
         try:
             r = client.chat.completions.create(
                 model=model,
@@ -199,18 +279,31 @@ async def ask_llm(prompt, msg=None):
                     {"role": "user", "content": content}
                 ],
                 temperature=0.2,
-                max_completion_tokens=700
+                max_completion_tokens=max_tokens,
+                timeout=30
             )
             return r.choices[0].message.content
 
-        except (RateLimitError, APIStatusError):
+        except Exception as exc:
+            last_exc = exc
+            # Rate limit or 429 -> set cooldown for this model
+            if isinstance(exc, RateLimitError) or getattr(exc, "status_code", None) == 429:
+                MODEL_COOLDOWNS[model] = now_utc() + timedelta(seconds=MODEL_COOLDOWN_SECONDS)
+                log_msg = f"Model {model} rate-limited; cooling down until {MODEL_COOLDOWNS[model].isoformat()}"
+                log.warning(log_msg)
+                continue
+            if isinstance(exc, APIStatusError):
+                log.warning("Model %s returned APIStatusError: %s", model, exc)
+                continue
+            log.exception("LLM call failed for model %s", model)
             continue
 
-    return "Нет ответа"
+    # all failed
+    raise RuntimeError(groq_limit_message(last_exc or Exception(), tried))
 
 
 # =========================================================
-# SAFE HENRIK PARSER (FIXED)
+# SAFE HENRIK PARSER
 # =========================================================
 
 cache = {}
@@ -239,111 +332,159 @@ def compact_tracker(data):
     return "\n".join(text)
 
 
-async def fetch_tracker(rid):
+async def fetch_tracker(rid, retries: int = 2, timeout_seconds: int = 10):
     if "#" not in rid:
         return None
 
-    if rid in cache and cache[rid]["time"] > datetime.utcnow() - timedelta(minutes=20):
+    # normalize
+    rid = rid.strip()
+
+    if rid in cache and cache[rid]["time"] > now_utc() - timedelta(minutes=20):
         return cache[rid]["data"]
 
     if not HENRIK_API_KEY:
         return None
 
-    name, tag = rid.split("#")
-
+    name, tag = rid.split("#", 1)
     headers = {"Authorization": HENRIK_API_KEY}
+    timeout = ClientTimeout(total=timeout_seconds)
 
-    async with ClientSession(headers=headers) as s:
+    attempt = 0
+    while attempt <= retries:
+        attempt += 1
         try:
-            acc_url = f"https://api.henrikdev.xyz/valorant/v2/account/{quote(name)}/{quote(tag)}"
-            async with s.get(acc_url) as r:
-                if r.status != 200:
-                    return None
-                acc = await r.json()
+            async with ClientSession(headers=headers, timeout=timeout) as s:
+                acc_url = f"https://api.henrikdev.xyz/valorant/v2/account/{quote(name)}/{quote(tag)}"
+                async with s.get(acc_url) as r:
+                    if r.status != 200:
+                        log.warning("Henrik account API returned %s for %s", r.status, rid)
+                        return None
+                    acc = await r.json()
 
-            region = (acc.get("data") or {}).get("region", "eu")
+                region = (acc.get("data") or {}).get("region", "eu")
 
-            mmr_url = f"https://api.henrikdev.xyz/valorant/v3/mmr/{region}/pc/{quote(name)}/{quote(tag)}"
-            match_url = f"https://api.henrikdev.xyz/valorant/v3/matches/{region}/{quote(name)}/{quote(tag)}?mode=competitive&size=5"
+                mmr_url = f"https://api.henrikdev.xyz/valorant/v3/mmr/{region}/pc/{quote(name)}/{quote(tag)}"
+                match_url = f"https://api.henrikdev.xyz/valorant/v3/matches/{region}/{quote(name)}/{quote(tag)}?mode=competitive&size=5"
 
-            async with s.get(mmr_url) as r1:
-                mmr = await r1.json() if r1.status == 200 else {}
+                async with s.get(mmr_url) as r1:
+                    mmr = await r1.json() if r1.status == 200 else {}
 
-            async with s.get(match_url) as r2:
-                matches = await r2.json() if r2.status == 200 else {}
+                async with s.get(match_url) as r2:
+                    matches = await r2.json() if r2.status == 200 else {}
 
-            parsed = {
-                "profile": {
-                    "name": name,
-                    "tag": tag,
-                    "region": region
-                },
-                "mmr": mmr,
-                "matches": matches
-            }
+                parsed = {
+                    "profile": {
+                        "name": name,
+                        "tag": tag,
+                        "region": region
+                    },
+                    "mmr": mmr,
+                    "matches": matches
+                }
 
-            cache[rid] = {"data": parsed, "time": datetime.utcnow()}
-            return parsed
+                cache[rid] = {"data": parsed, "time": now_utc()}
+                return parsed
 
-        except Exception:
-            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Henrik fetch attempt %s failed for %s: %s", attempt, rid, exc)
+            if attempt > retries:
+                return None
+            await asyncio.sleep(1 + attempt)
 
 
 # =========================================================
-# HANDLER FIXED
+# HANDLERS
 # =========================================================
 
 @dp.message(Command("start"))
 async def start(m: Message):
-    save_chat(m.chat.id, user_name(m), "/start")
-    await m.answer("Latumbot V5.1 активен")
+    await save_chat(m.chat.id, user_name(m), "/start")
+    await m.answer("Latumbot: активен")
 
 
 @dp.message(F.text)
 async def handler(m: Message):
     text = m.text or ""
 
-    save_chat(m.chat.id, user_name(m), text)
+    # non-blocking DB writes
+    await save_chat(m.chat.id, user_name(m), text)
 
     if not is_bot(text):
         return
 
     clean = strip_bot(text)
 
-    upsert_player(m.chat.id, m.from_user.id, user_name(m))
+    await upsert_player(m.chat.id, m.from_user.id, user_name(m))
 
     # roles
     if "смокер" in clean:
-        set_field(m.chat.id, m.from_user.id, "role", "controller")
-        return await m.answer("ок, смокер")
+        await set_field(m.chat.id, m.from_user.id, "role", "controller")
+        return await m.answer("по памяти: записал — смокер")
 
     if "дуэлянт" in clean:
-        set_field(m.chat.id, m.from_user.id, "role", "duelist")
-        return await m.answer("ок, дуэлянт")
+        await set_field(m.chat.id, m.from_user.id, "role", "duelist")
+        return await m.answer("по памяти: записал — дуэлянт")
 
-    # tracker FIXED
+    # tracker
     if "трекер" in clean:
         rid = extract_riot_id(clean)
 
         if rid:
-            data = await fetch_tracker(f"{rid[0]}#{rid[1]}")
+            rid_str = f"{rid[0]}#{rid[1]}"
+            data = await fetch_tracker(rid_str)
             if not data:
-                return await m.answer("нет данных")
+                return await m.answer("По Tracker: нет данных или Henrik API не доступен.")
 
             prompt = f"""
 АНАЛИЗ ИГРОКА:
 {compact_tracker(data)}
 
-1 вывод
-2 ошибки
-3 улучшения
+Дай короткий вывод и 3 конкретных действия. Без выдумок.
 """
 
-            ans = await ask_llm(prompt, m)
+            try:
+                ans = await ask_llm(prompt, m)
+            except RuntimeError as exc:
+                ans = str(exc)
+            except Exception as exc:
+                log.exception("LLM failed: %s", exc)
+                ans = "Ошибка LLM. Попробуйте позже."
             return await m.answer(ans)
 
-    ans = await ask_llm(clean, m)
+    try:
+        ans = await ask_llm(clean, m)
+    except RuntimeError as exc:
+        ans = str(exc)
+    except Exception as exc:
+        log.exception("LLM failed: %s", exc)
+        ans = "Ошибка LLM. Попробуйте позже."
+
     await m.answer(ans)
+
+
+# =========================================================
+# HEALTH SERVER (optional)
+# =========================================================
+
+async def health_check(_request):
+    return web.Response(text="ok")
+
+
+async def start_health_server():
+    if not PORT or not PORT.isdigit():
+        log.info("PORT not set or invalid; skipping health server")
+        return None
+
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(PORT))
+    await site.start()
+    log.info("Health server listening on 0.0.0.0:%s", PORT)
+    return runner
 
 
 # =========================================================
@@ -352,9 +493,55 @@ async def handler(m: Message):
 
 async def main():
     init_db()
-    bot = Bot(TELEGRAM_TOKEN)
-    await dp.start_polling(bot)
+
+    health_runner = None
+    bot = None
+    try:
+        health_runner = await start_health_server()
+
+        bot = Bot(TELEGRAM_TOKEN)
+
+        # ensure webhook is cleared to avoid TelegramConflictError
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except TelegramConflictError:
+            log.warning("Webhook conflict when deleting webhook; continuing")
+        except Exception:
+            log.exception("Failed to delete webhook; continuing")
+
+        # resilient polling loop: restart on unexpected crashes with backoff
+        attempts = 0
+        while True:
+            try:
+                await dp.start_polling(bot)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                attempts += 1
+                log.exception("Polling crashed (attempt %s): %s", attempts, exc)
+                if attempts >= 5:
+                    log.error("Too many polling failures; exiting")
+                    raise
+                backoff = min(30, attempts * 5)
+                await asyncio.sleep(backoff)
+
+    finally:
+        # cleanup
+        try:
+            if health_runner:
+                await health_runner.cleanup()
+        except Exception:
+            log.exception("Failed to cleanup health server")
+        try:
+            if bot is not None:
+                await bot.session.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Shutdown requested")
