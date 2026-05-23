@@ -27,7 +27,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HENRIK_API_KEY = os.getenv("HENRIK_API_KEY") or os.getenv("HDEV_API_KEY")
 
-BOT_USERNAME = (os.getenv("BOT_USERNAME") or "@latumbot").lower()
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "@ailatumbot").lower()
 if not BOT_USERNAME.startswith("@"):
     BOT_USERNAME = "@" + BOT_USERNAME
 
